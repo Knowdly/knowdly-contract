@@ -11,11 +11,13 @@
 //   7. WASM upgrade — preserves all state while updating contract logic
 //   8. Marketplace — list_for_sale(), buy_listing(), cancel_listing()
 //      Buyer calls buy_listing() which atomically:
-//        - verifies the listing exists and price matches
+//        - verifies the listing exists and the buyer does not already own the book
+//        - moves the asking price from the buyer, splitting it between the
+//          creator's royalty, the platform fee and the seller
 //        - transfers ownership to the buyer
 //        - removes the listing
 //        - emits a sale event
-//      Payment (USDC split) is handled off-chain before calling buy_listing()
+//      Payment settles inside the invocation; see set_payment_token()
 
 #![no_std]
 
@@ -24,6 +26,7 @@ use soroban_sdk::{
     contractimpl,
     contracttype,
     symbol_short,
+    token,
     Address,
     Env,
     String,
@@ -77,6 +80,8 @@ pub enum DataKey {
     Ownership(Address, u64),
     Platform,
     PlatformFeeBps,
+    // asset every sale settles in
+    PaymentToken,
     OwnerTokens(Address),
     // marketplace listing — keyed by token_id
     Listing(u64),
@@ -124,6 +129,12 @@ impl KnowdlyBookContract {
     pub fn initialise(env: Env, platform: Address, fee_bps: u32) {
         platform.require_auth();
 
+        // without this guard anyone can re-initialise the live contract,
+        // overwrite the platform address, and then call upgrade()
+        if env.storage().instance().has(&DataKey::Platform) {
+            panic!("Contract already initialised");
+        }
+
         if fee_bps > 1000 {
             panic!("Platform fee cannot exceed 10%");
         }
@@ -132,6 +143,33 @@ impl KnowdlyBookContract {
         env.storage().instance().set(&DataKey::PlatformFeeBps, &fee_bps);
         env.storage().instance().set(&DataKey::NextBookId,     &0u64);
         env.storage().instance().set(&DataKey::NextTokenId,    &0u64);
+    }
+
+    // set_payment_token — configures the asset every sale settles in
+    //
+    // Kept separate from initialise() so a contract that is already live can
+    // upgrade() into this version and then be configured; the re-init guard
+    // above means initialise() is no longer available for that.
+    pub fn set_payment_token(env: Env, platform: Address, payment_token: Address) {
+        platform.require_auth();
+
+        let stored_platform: Address = env
+            .storage().instance()
+            .get(&DataKey::Platform)
+            .expect("Contract not initialised");
+
+        if stored_platform != platform {
+            panic!("Only the platform can set the payment token");
+        }
+
+        env.storage().instance().set(&DataKey::PaymentToken, &payment_token);
+    }
+
+    pub fn get_payment_token(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::PaymentToken)
+            .expect("Payment token not configured")
     }
 
     // ── Creator API ───────────────────────────────────────────────────────────
@@ -243,6 +281,10 @@ impl KnowdlyBookContract {
             panic!("You already own this book");
         }
 
+        // move the money before minting anything; a primary sale carries no
+        // royalty because the creator is already the seller
+        settle_sale(&env, &buyer, &book.publisher, &book.publisher, book.price, 0);
+
         let token_id: u64 = env
             .storage().instance()
             .get(&DataKey::NextTokenId)
@@ -307,18 +349,39 @@ impl KnowdlyBookContract {
             .get(&DataKey::Book(token.book_id))
             .expect("Book not found");
 
-        let platform_fee_bps: u32 = env
-            .storage().instance()
-            .get(&DataKey::PlatformFeeBps)
-            .unwrap_or(250);
+        // one address holding two copies of a book would corrupt the
+        // Ownership flag below, which is a single bool per (address, book)
+        let recipient_owns: bool = env
+            .storage().persistent()
+            .get(&DataKey::Ownership(new_owner.clone(), token.book_id))
+            .unwrap_or(false);
 
-        let royalty_amount  = (sale_price * book.royalty_bps as i128) / 10_000;
-        let platform_amount = (sale_price * platform_fee_bps as i128) / 10_000;
-        let seller_amount   = sale_price - royalty_amount - platform_amount;
-
-        if seller_amount < 0 {
-            panic!("Sale price too low to cover royalty and platform fees");
+        if recipient_owns {
+            panic!("Recipient already owns this book");
         }
+
+        // a priced transfer settles here; sale_price 0 is a gift and moves
+        // nothing, which also means it pays no royalty
+        //
+        // the recipient is the payer, so their auth has to be taken in this
+        // root invocation: the token contract's own require_auth would be a
+        // non-root authorization and the host rejects it
+        if sale_price > 0 {
+            new_owner.require_auth();
+        }
+
+        let (royalty_amount, platform_amount, seller_amount) = if sale_price > 0 {
+            settle_sale(
+                &env,
+                &new_owner,
+                &token.owner,
+                &book.publisher,
+                sale_price,
+                book.royalty_bps,
+            )
+        } else {
+            (0i128, 0i128, 0i128)
+        };
 
         let old_owner = token.owner.clone();
 
@@ -472,6 +535,32 @@ impl KnowdlyBookContract {
             panic!("Token owner has changed — listing is invalid");
         }
 
+        let buyer_owns: bool = env
+            .storage().persistent()
+            .get(&DataKey::Ownership(buyer.clone(), token.book_id))
+            .unwrap_or(false);
+
+        if buyer_owns {
+            panic!("You already own this book");
+        }
+
+        let book: Book = env
+            .storage().persistent()
+            .get(&DataKey::Book(token.book_id))
+            .expect("Book not found");
+
+        // the buyer's signature on these transfers is what proves payment;
+        // without them the asking price is a number in a listing and nothing
+        // stops any observer calling buy_listing on a live listing for free
+        let (_royalty, _fee, _seller) = settle_sale(
+            &env,
+            &buyer,
+            &listing.seller,
+            &book.publisher,
+            listing.asking_price,
+            book.royalty_bps,
+        );
+
         let old_owner = token.owner.clone();
         let book_id   = token.book_id;
 
@@ -577,12 +666,102 @@ impl KnowdlyBookContract {
     }
 }
 
+// ── Settlement ────────────────────────────────────────────────────────────────
+//
+// Splitting a price and moving it are two separate acts on Soroban: the split
+// is i128 arithmetic, the movement is a call into the token contract. Deleting
+// the calls below leaves code that compiles, succeeds, and emits an event
+// describing a payment that never happened, so every sale routes through here.
+//
+// The payer's signature is re-entered by the token contract for each exact
+// amount, which is what makes the buyer's require_auth mean "paid" rather than
+// just "asked".
+
+fn settle_sale(
+    env:         &Env,
+    payer:       &Address,
+    seller:      &Address,
+    publisher:   &Address,
+    total:       i128,
+    royalty_bps: u32,
+) -> (i128, i128, i128) {
+    if total <= 0 {
+        panic!("Sale price must be positive");
+    }
+
+    let platform: Address = env
+        .storage().instance()
+        .get(&DataKey::Platform)
+        .expect("Contract not initialised");
+
+    let platform_fee_bps: u32 = env
+        .storage().instance()
+        .get(&DataKey::PlatformFeeBps)
+        .unwrap_or(250);
+
+    let royalty_amount  = basis_points(total, royalty_bps);
+    let platform_amount = basis_points(total, platform_fee_bps);
+    let seller_amount   = total - royalty_amount - platform_amount;
+
+    if seller_amount < 0 {
+        panic!("Sale price too low to cover royalty and platform fees");
+    }
+
+    let payment_token: Address = env
+        .storage().instance()
+        .get(&DataKey::PaymentToken)
+        .expect("Payment token not configured");
+
+    let asset = token::TokenClient::new(env, &payment_token);
+
+    if royalty_amount > 0 {
+        asset.transfer(payer, publisher, &royalty_amount);
+    }
+    if platform_amount > 0 {
+        asset.transfer(payer, &platform, &platform_amount);
+    }
+    if seller_amount > 0 {
+        asset.transfer(payer, seller, &seller_amount);
+    }
+
+    (royalty_amount, platform_amount, seller_amount)
+}
+
+fn basis_points(amount: i128, bps: u32) -> i128 {
+    amount
+        .checked_mul(bps as i128)
+        .and_then(|scaled| scaled.checked_div(10_000))
+        .expect("Fee calculation overflowed")
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use soroban_sdk::token::{StellarAssetClient, TokenClient};
     use soroban_sdk::{testutils::Address as _, Env};
+
+    // deploys a stub asset and points the contract at it, so that the sale
+    // paths under test actually have somewhere to move money
+    fn payment_asset(
+        env:      &Env,
+        client:   &KnowdlyBookContractClient,
+        platform: &Address,
+    ) -> Address {
+        let issuer = Address::generate(env);
+        let asset  = env.register_stellar_asset_contract_v2(issuer).address();
+        client.set_payment_token(platform, &asset);
+        asset
+    }
+
+    fn fund(env: &Env, asset: &Address, who: &Address, amount: i128) {
+        StellarAssetClient::new(env, asset).mint(who, &amount);
+    }
+
+    fn balance(env: &Env, asset: &Address, who: &Address) -> i128 {
+        TokenClient::new(env, asset).balance(who)
+    }
 
     #[test]
     fn test_register_book() {
@@ -655,6 +834,8 @@ mod test {
 
         env.mock_all_auths();
         client.initialise(&platform, &250u32);
+        let asset = payment_asset(&env, &client, &platform);
+        fund(&env, &asset, &reader, 100_000_000);
 
         let book_id = client.register_book(
             &creator,
@@ -685,6 +866,9 @@ mod test {
 
         env.mock_all_auths();
         client.initialise(&platform, &250u32);
+        let asset = payment_asset(&env, &client, &platform);
+        fund(&env, &asset, &reader_a, 100_000_000);
+        fund(&env, &asset, &reader_b, 100_000_000);
 
         let book_id  = client.register_book(
             &creator,
@@ -712,6 +896,8 @@ mod test {
 
         env.mock_all_auths();
         client.initialise(&platform, &250u32);
+        let asset = payment_asset(&env, &client, &platform);
+        fund(&env, &asset, &reader, 100_000_000);
 
         let book_id_a = client.register_book(
             &creator,
@@ -752,6 +938,9 @@ mod test {
 
         env.mock_all_auths();
         client.initialise(&platform, &250u32);
+        let asset = payment_asset(&env, &client, &platform);
+        fund(&env, &asset, &reader_a, 100_000_000);
+        fund(&env, &asset, &reader_b, 100_000_000);
 
         let book_id  = client.register_book(
             &creator,
@@ -784,6 +973,9 @@ mod test {
 
         env.mock_all_auths();
         client.initialise(&platform, &250u32);
+        let asset = payment_asset(&env, &client, &platform);
+        fund(&env, &asset, &seller, 100_000_000);
+        fund(&env, &asset, &buyer, 100_000_000);
 
         let book_id = client.register_book(
             &creator,
@@ -821,6 +1013,165 @@ mod test {
         // (would panic if we called get_listing now — listing no longer exists)
     }
 
+    // ── Settlement tests ──────────────────────────────────────────────────
+    //
+    // These assert on balances rather than on the call returning. A test that
+    // only checks ownership flipped passes over a payment path that does not
+    // exist, which is how the off-chain-payment version of this contract kept
+    // a green suite.
+
+    #[test]
+    fn test_purchase_pays_the_creator() {
+        let env         = Env::default();
+        let contract_id = env.register(KnowdlyBookContract, ());
+        let client      = KnowdlyBookContractClient::new(&env, &contract_id);
+        let platform    = Address::generate(&env);
+        let creator     = Address::generate(&env);
+        let reader      = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialise(&platform, &250u32);
+        let asset = payment_asset(&env, &client, &platform);
+        fund(&env, &asset, &reader, 100_000_000);
+
+        let book_id = client.register_book(
+            &creator,
+            &10_000_000i128,
+            &500u32,
+            &String::from_str(&env, "arweave-tx-primary"),
+            &String::from_str(&env, "Primary Sale Book"),
+        );
+
+        client.purchase(&reader, &book_id);
+
+        // 250 bps of 10_000_000 to the platform, the rest to the creator
+        assert_eq!(balance(&env, &asset, &reader),   90_000_000);
+        assert_eq!(balance(&env, &asset, &platform),    250_000);
+        assert_eq!(balance(&env, &asset, &creator),   9_750_000);
+    }
+
+    #[test]
+    fn test_buy_listing_settles_the_split() {
+        let env         = Env::default();
+        let contract_id = env.register(KnowdlyBookContract, ());
+        let client      = KnowdlyBookContractClient::new(&env, &contract_id);
+        let platform    = Address::generate(&env);
+        let creator     = Address::generate(&env);
+        let seller      = Address::generate(&env);
+        let buyer       = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialise(&platform, &250u32);
+        let asset = payment_asset(&env, &client, &platform);
+        fund(&env, &asset, &seller, 100_000_000);
+        fund(&env, &asset, &buyer,  100_000_000);
+
+        let book_id = client.register_book(
+            &creator,
+            &10_000_000i128,
+            &500u32,
+            &String::from_str(&env, "arweave-tx-resale"),
+            &String::from_str(&env, "Resale Split Book"),
+        );
+
+        let token_id = client.purchase(&seller, &book_id);
+        let creator_after_primary = balance(&env, &asset, &creator);
+
+        client.list_for_sale(&seller, &token_id, &8_000_000i128);
+        client.buy_listing(&buyer, &token_id);
+
+        // 8_000_000 split: 500 bps royalty, 250 bps platform fee, rest to seller
+        assert_eq!(balance(&env, &asset, &buyer), 92_000_000);
+        assert_eq!(
+            balance(&env, &asset, &creator),
+            creator_after_primary + 400_000,
+        );
+        assert_eq!(client.owns_book(&buyer, &book_id), true);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_buy_listing_without_funds_fails() {
+        let env         = Env::default();
+        let contract_id = env.register(KnowdlyBookContract, ());
+        let client      = KnowdlyBookContractClient::new(&env, &contract_id);
+        let platform    = Address::generate(&env);
+        let creator     = Address::generate(&env);
+        let seller      = Address::generate(&env);
+        let pauper      = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialise(&platform, &250u32);
+        let asset = payment_asset(&env, &client, &platform);
+        fund(&env, &asset, &seller, 100_000_000);
+
+        let book_id = client.register_book(
+            &creator,
+            &10_000_000i128,
+            &500u32,
+            &String::from_str(&env, "arweave-tx-free"),
+            &String::from_str(&env, "Not Free Book"),
+        );
+
+        let token_id = client.purchase(&seller, &book_id);
+        client.list_for_sale(&seller, &token_id, &8_000_000i128);
+
+        // an unfunded observer calling buy_listing on a live listing used to
+        // take the token for nothing; now the transfer traps
+        client.buy_listing(&pauper, &token_id);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_initialise_cannot_be_called_twice() {
+        let env         = Env::default();
+        let contract_id = env.register(KnowdlyBookContract, ());
+        let client      = KnowdlyBookContractClient::new(&env, &contract_id);
+        let platform    = Address::generate(&env);
+        let attacker    = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialise(&platform, &250u32);
+
+        // re-initialising would hand the attacker the platform role, and with
+        // it upgrade(), plus reset the id counters onto existing records
+        client.initialise(&attacker, &0u32);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_buy_listing_rejects_a_second_copy() {
+        let env         = Env::default();
+        let contract_id = env.register(KnowdlyBookContract, ());
+        let client      = KnowdlyBookContractClient::new(&env, &contract_id);
+        let platform    = Address::generate(&env);
+        let creator     = Address::generate(&env);
+        let reader_a    = Address::generate(&env);
+        let reader_b    = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialise(&platform, &250u32);
+        let asset = payment_asset(&env, &client, &platform);
+        fund(&env, &asset, &reader_a, 100_000_000);
+        fund(&env, &asset, &reader_b, 100_000_000);
+
+        let book_id = client.register_book(
+            &creator,
+            &10_000_000i128,
+            &500u32,
+            &String::from_str(&env, "arweave-tx-dupe"),
+            &String::from_str(&env, "Duplicate Copy Book"),
+        );
+
+        let token_a = client.purchase(&reader_a, &book_id);
+        client.purchase(&reader_b, &book_id);
+
+        // reader_b already owns this book; a second copy would make the single
+        // Ownership bool wrong the moment either copy moves on
+        client.list_for_sale(&reader_a, &token_a, &8_000_000i128);
+        client.buy_listing(&reader_b, &token_a);
+    }
+
     #[test]
     fn test_marketplace_cancel_listing() {
         let env         = Env::default();
@@ -832,6 +1183,8 @@ mod test {
 
         env.mock_all_auths();
         client.initialise(&platform, &250u32);
+        let asset = payment_asset(&env, &client, &platform);
+        fund(&env, &asset, &seller, 100_000_000);
 
         let book_id = client.register_book(
             &creator,
